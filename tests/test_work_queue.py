@@ -10,24 +10,6 @@ from ticketing.db import connect
 
 
 @pytest.fixture
-def advance(monkeypatch):
-    timestamp = 1_800_000_000
-
-    def connect_at_test_time():
-        db = connect()
-        with db.cursor() as cursor:
-            cursor.execute("SET SESSION timestamp = %s", (timestamp,))
-        return db
-
-    def advance_clock(seconds):
-        nonlocal timestamp
-        timestamp += seconds
-
-    monkeypatch.setattr(queue, "connect", connect_at_test_time)
-    return advance_clock
-
-
-@pytest.fixture
 def enqueue(advance):
     ids = []
 

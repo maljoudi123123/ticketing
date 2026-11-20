@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from pymysql.constants import ER
 from pymysql.cursors import DictCursor
 
+from ticketing.classifier import Category, Priority
 from ticketing.db import connect
 
 app = FastAPI(title="Ticketing")
@@ -22,10 +23,18 @@ class TicketInput(BaseModel):
 
 class Ticket(TicketInput):
     status: Literal["pending", "classified", "failed"]
+    category: Category | None = None
+    priority: Priority | None = None
+    summary: str | None = None
+    failure_reason: str | None = None
 
 
 def fetch_ticket(cursor: DictCursor, ticket_id: str) -> Ticket:
-    cursor.execute("SELECT id, subject, body, status FROM tickets WHERE id = %s", (ticket_id,))
+    cursor.execute(
+        """SELECT id, subject, body, status, category, priority, summary, failure_reason
+           FROM tickets WHERE id = %s""",
+        (ticket_id,),
+    )
     row = cursor.fetchone()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Ticket not found")
@@ -35,6 +44,7 @@ def fetch_ticket(cursor: DictCursor, ticket_id: str) -> Ticket:
 @app.post(
     "/tickets",
     status_code=status.HTTP_202_ACCEPTED,
+    response_model_exclude_none=True,
     responses={
         200: {"model": Ticket, "description": "Identical ticket already exists"},
         409: {"description": "ID already used for different content"},
@@ -63,7 +73,7 @@ def create_ticket(ticket: TicketInput, response: Response) -> Ticket:
         return Ticket(**ticket.model_dump(), status="pending")
 
 
-@app.get("/tickets/{ticket_id}")
+@app.get("/tickets/{ticket_id}", response_model_exclude_none=True)
 def get_ticket(ticket_id: TicketID) -> Ticket:
     with connect() as db, db.cursor() as cursor:
         return fetch_ticket(cursor, ticket_id)
