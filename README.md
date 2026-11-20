@@ -1,6 +1,6 @@
 # Support ticket classification service
 
-The service accepts tickets and retrieves them by ID. Each new ticket starts as `pending`. Asynchronous classification and filtered listing are planned in later PRs.
+The API accepts a ticket and immediately returns its ID and `pending` status. A separate worker classifies it using a local fake. Fetch the ticket by ID to read the result. Filtered listing is planned for PR 5.
 
 ## Run locally
 
@@ -10,6 +10,12 @@ With Docker Compose, uv, and Python 3.12 or newer installed, run these commands 
 docker compose up -d --wait db
 uv sync --locked
 uv run --locked uvicorn ticketing.api:app
+```
+
+Start the worker in another terminal from the same directory. It polls the same database as the API and processes one ticket at a time. Run it on macOS or Linux, where Python supports the POSIX timer used for the classifier deadline.
+
+```sh
+uv run --locked python -m ticketing.worker
 ```
 
 Compose applies the SQL files in `migrations/` in order on a fresh MySQL 8.4 volume. The API defaults to the local Compose credentials on `127.0.0.1:3307`. To use another MySQL instance, apply the migrations in order and configure `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD` for the API.
@@ -29,7 +35,7 @@ curl -i http://127.0.0.1:8000/tickets -H 'Content-Type: application/json' \
 curl -i http://127.0.0.1:8000/tickets/t-1001
 ```
 
-The first submission returns `202`. Repeating it returns `200`. Changing the subject or body while reusing the ID returns `409`.
+The first submission returns `202`. Poll `GET /tickets/t-1001` to see `classified` with top-level `category`, `priority`, and `summary`, or `failed` with a `failure_reason`. An identical submission returns the current ticket with `200`. Changing the subject or body while reusing the ID returns `409`.
 
 ### Run the tests
 
@@ -61,11 +67,11 @@ Inserting a pending ticket also schedules it for classification. This avoids a f
 
 The database operations live in `ticketing.work_queue`. Each operation opens a short transaction. `claim_next()` uses `FOR UPDATE SKIP LOCKED` and returns the ticket content, attempt number, and a fresh token. `available_at` is the earliest time another worker can claim the row. It holds the lease expiry while owned and the retry time after a failure. MySQL supplies UTC time for all comparisons. The current lease lasts 30 seconds.
 
-Pass a validated `Classification` to `complete()`, or call `record_failure()` with a reason and retry delay. Both return `False` when the claim is stale. A poll also retires expired final attempts before returning the next ticket. PR 4 will run this polling loop and connect it to the classifier.
+The worker polls every half second when idle and immediately checks for more work after each attempt. It passes validated results to `complete()` and schedules failures through `record_failure()`. Both return `False` when the claim is stale. A poll also retires expired final attempts before returning the next ticket.
 
-1. In a short transaction, claim an eligible `pending` row by setting a unique lease token and expiry and incrementing its attempt count. Commit before contacting the classifier. Set the model timeout shorter than the lease.
+1. In a short transaction, claim an eligible `pending` row by setting a unique lease token and expiry and incrementing its attempt count. Commit before contacting the classifier. The worker gives the classifier 10 seconds within the 30-second lease.
 2. Validate the response. In one transaction, write the three validated fields and set the status to `classified`. Condition the update on the current lease token so a worker that lost its claim cannot overwrite a later result.
-3. On a timeout, transient provider error, or validation error, release the claim and schedule a retry with backoff. After three attempts, set the status to `failed` and store a short reason such as `invalid_model_output`. Keep invalid output out of the classification fields.
+3. On a timeout, provider exception, or validation error, release the claim. Retry after one second for the first failure and two seconds for the second. A third failure sets the status to `failed` with `model_timeout`, `provider_error`, or `invalid_model_output`.
 4. After a restart, reclaim expired leases. If the final attempt expired, mark the ticket failed so it cannot stay pending forever. A crash after the provider responds and before the result commits can cause another model call. Duplicate client submissions never trigger that retry.
 
 ## Classifier boundary

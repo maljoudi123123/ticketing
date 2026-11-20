@@ -9,15 +9,6 @@ from ticketing.api import app
 from ticketing.db import connect
 
 
-@pytest.fixture
-def ticket():
-    ticket_id = f"test-{uuid4().hex}"
-    yield {"id": ticket_id, "subject": "", "body": "أحتاج نسخة من الفاتورة 🧾"}
-    with connect() as db, db.cursor() as cursor:
-        cursor.execute("DELETE FROM tickets WHERE id = %s", (ticket_id,))
-        db.commit()
-
-
 def test_concurrent_replay_creates_one_pending_ticket(ticket):
     start = Barrier(2)
 
