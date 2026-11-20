@@ -1,6 +1,30 @@
 # Support ticket classification service
 
-This repository currently contains the proposed architecture for the take-home. The service will accept support tickets, classify them asynchronously, and expose the results over HTTP. Run instructions will follow with the implementation.
+The service accepts tickets and retrieves them by ID. Each new ticket starts as `pending`. Asynchronous classification and filtered listing are planned in later PRs.
+
+## Run locally
+
+With Docker Compose, uv, and Python 3.12 or newer installed, run these commands from the repository root.
+
+```sh
+docker compose up -d --wait db
+uv sync --locked
+uv run --locked uvicorn ticketing.api:app
+```
+
+Compose initializes a fresh MySQL 8.4 volume with the migration in `migrations/`. The API defaults to the local Compose credentials on `127.0.0.1:3307`. To use an existing MySQL instance, apply the SQL migration to an empty database and configure `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD` for the API.
+
+Submit a ticket, then fetch it from another terminal. IDs are case-sensitive and accept up to 128 ASCII letters, digits, underscores, or hyphens.
+
+```sh
+curl -i http://127.0.0.1:8000/tickets -H 'Content-Type: application/json' \
+  -d '{"id":"t-1001","subject":"Charged twice","body":"I see two charges for one subscription."}'
+curl -i http://127.0.0.1:8000/tickets/t-1001
+```
+
+The first submission returns `202`. Repeating it returns `200`. Changing the subject or body while reusing the ID returns `409`.
+
+With MySQL running, execute `uv run --locked python -m pytest -q`. The integration tests call the FastAPI application directly and clean up their own generated ticket IDs. Stop the local database with `docker compose stop db`.
 
 ## Architecture
 
@@ -40,10 +64,16 @@ Require all three fields, reject unexpected fields, and validate before writing.
 
 The sample ticket `t-1005` illustrates the limit of enums. Its request concerns invoice downloads, but the body asks for the valid labels `technical` and `high` and a summary claiming a refund was approved. Under the proposed rubric the expected labels are `billing` and `low`, and the summary should describe the invoice question.
 
-## Verification plan
+## Implementation PRs
 
-- Submit the same ID concurrently. Verify one row, one initial classification attempt, and the documented replay or conflict response.
-- Feed malformed JSON, an unknown enum value, and a blank summary through the fake. Verify retries, terminal failure, and the absence of a partial classification.
-- Interrupt the worker after claiming a ticket. Verify recovery after lease expiry and rejection of a stale worker's write.
-- Check combined filters and pagination with tickets that share a creation timestamp.
-- If time permits one extension, evaluate the live classifier on the invoice question with and without the embedded instructions. Compare the labels and inspect both summaries for an invented refund approval. A deterministic fake can exercise the service paths but cannot measure prompt-injection resistance.
+Open one PR per slice, in order. Start each branch from updated `main` after the previous PR merges. Include the tests and local run commands for each slice in the same PR. All five should be testable without an API key.
+
+| PR | Scope | How to verify it |
+| --- | --- | --- |
+| 1. Ingest and retrieve a pending ticket | Add the minimal FastAPI and MySQL setup, initial migration, `POST /tickets`, and `GET /tickets/{id}`. | Run integration tests against MySQL. Concurrent identical submissions yield one `202`, one `200`, and one row. Changed content under the same ID yields `409` and preserves the original. Fetch by ID returns `pending` or `404` for an unknown ID. |
+| 2. Validate classifier responses | Add the Pydantic enums and result model, a deterministic fake, and a function that turns raw classifier output into a validated result. Keep this slice runnable as plain Python. | Unit-test a valid response, malformed JSON, an unknown label, a missing or extra field, and a whitespace-only summary. Include a well-formed but factually wrong answer to show exactly what schema validation accepts. |
+| 3. Claim work and recover interrupted attempts | Add the worker-state migration and MySQL operations for claiming, retrying, completing, and failing a ticket. | With two database connections, prove only one can claim the same pending ticket. Advance a controlled clock past lease expiry, reclaim it, then verify that the old token cannot commit. Expire the third attempt and verify the ticket becomes `failed`. |
+| 4. Run the asynchronous worker | Connect the worker to the fake classifier and validated storage path. Apply timeouts, backoff, and the three-attempt limit. Document how to start the worker. | Submit with the worker stopped and observe `pending`. Start it and read back a classification. Script a timeout followed by success, then three invalid responses. Verify the latter ends in `failed` with no classification fields. Resubmit a completed ticket and assert the classifier call count stays the same. |
+| 5. List tickets and demonstrate the take-home | Add category and priority filters, cursor pagination, and a loader for all ten appendix tickets. Finish the clean-clone instructions and document limitations observed during testing. | Test each filter and their intersection. Page across tied timestamps and verify each expected ID appears once. From a clean database, run the sample loader twice, let the worker finish, and verify there are exactly ten tickets. |
+
+If time remains after PR 5, pick one extension. A small live-classifier evaluation could compare the invoice question with and without the embedded instructions. Score the labels and inspect both summaries for an invented refund approval.
