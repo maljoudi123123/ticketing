@@ -50,7 +50,14 @@ Inserting a pending ticket also schedules it for classification. This avoids a f
 
 ## Classifier boundary
 
-The default classifier will be a deterministic fake that works without credentials and can return malformed responses in tests. Both the fake and any live adapter pass through the same validation step.
+`ticketing.classifier.classify_ticket(subject, body)` returns a validated `Classification`. Its default provider is a deterministic keyword-based fake. To supply your own provider, pass a callable via `classifier=` that takes the subject and body and returns raw JSON text. Pydantic raises `ValidationError` for malformed JSON or invalid fields. Tests use this entry point to supply broken responses.
+
+Try the classifier and run its unit tests locally with just Python and uv.
+
+```sh
+uv run --locked python -c 'from ticketing.classifier import classify_ticket; print(classify_ticket("Invoice", "Where can I download it?").model_dump_json())'
+uv run --locked python -m pytest -q tests/test_classifier.py
+```
 
 For a live adapter, use one OpenAI Responses API call with Structured Outputs. The Decisions API fits the two fixed-choice labels. The required one-sentence summary makes a single structured generation simpler than combining separate classification and generation steps. [Decisions API](https://developers.openai.com/api/docs/guides/decisions/) · [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs/)
 
