@@ -1,7 +1,7 @@
 from typing import Annotated, Literal
 
 import pymysql
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from pymysql.constants import ER
 from pymysql.cursors import DictCursor
@@ -11,6 +11,7 @@ from ticketing.db import connect
 
 app = FastAPI(title="Ticketing")
 TicketID = Annotated[str, StringConstraints(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
+TICKET_FIELDS = "id, subject, body, status, category, priority, summary, failure_reason"
 
 
 class TicketInput(BaseModel):
@@ -29,10 +30,14 @@ class Ticket(TicketInput):
     failure_reason: str | None = None
 
 
+class TicketPage(BaseModel):
+    items: list[Ticket]
+    next_cursor: TicketID | None = None
+
+
 def fetch_ticket(cursor: DictCursor, ticket_id: str) -> Ticket:
     cursor.execute(
-        """SELECT id, subject, body, status, category, priority, summary, failure_reason
-           FROM tickets WHERE id = %s""",
+        f"SELECT {TICKET_FIELDS} FROM tickets WHERE id = %s",
         (ticket_id,),
     )
     row = cursor.fetchone()
@@ -77,3 +82,40 @@ def create_ticket(ticket: TicketInput, response: Response) -> Ticket:
 def get_ticket(ticket_id: TicketID) -> Ticket:
     with connect() as db, db.cursor() as cursor:
         return fetch_ticket(cursor, ticket_id)
+
+
+@app.get("/tickets", response_model_exclude_none=True)
+def list_tickets(
+    category: Category | None = None,
+    priority: Priority | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: TicketID | None = None,
+) -> TicketPage:
+    conditions = []
+    params = []
+    if category is not None or priority is not None:
+        conditions.append("status = 'classified'")
+    if category is not None:
+        conditions.append("category = %s")
+        params.append(category.value)
+    if priority is not None:
+        conditions.append("priority = %s")
+        params.append(priority.value)
+
+    with connect() as db, db.cursor() as query:
+        if cursor is not None:
+            query.execute("SELECT created_at FROM tickets WHERE id = %s", (cursor,))
+            anchor = query.fetchone()
+            if anchor is None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Unknown ticket cursor")
+            conditions.append("(created_at, id) < (%s, %s)")
+            params.extend((anchor["created_at"], cursor))
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        query.execute(
+            f"SELECT {TICKET_FIELDS} FROM tickets{where} ORDER BY created_at DESC, id DESC LIMIT %s",
+            (*params, limit + 1),
+        )
+        rows = query.fetchall()
+
+    items = [Ticket(**row) for row in rows[:limit]]
+    return TicketPage(items=items, next_cursor=items[-1].id if len(rows) > limit else None)

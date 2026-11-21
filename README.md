@@ -1,12 +1,14 @@
 # Support ticket classification service
 
-The API accepts a ticket and immediately returns its ID and `pending` status. A separate worker classifies it using a local fake. Fetch the ticket by ID to read the result. Filtered listing is planned for PR 5.
+The API accepts a ticket and immediately returns its ID and `pending` status. A separate worker classifies it using a local fake. Fetch the result by ID, or list tickets by category and priority. The local demo runs without an API key.
 
 ## Run locally
 
-With Docker Compose, uv, and Python 3.12 or newer installed, run these commands from the repository root.
+With Docker Compose, uv, and Python 3.12 or newer installed, clone the repository and start the API.
 
 ```sh
+git clone https://github.com/maljoudi123123/ticketing.git
+cd ticketing
 docker compose up -d --wait db
 uv sync --locked
 uv run --locked uvicorn ticketing.api:app
@@ -18,6 +20,20 @@ Start the worker in another terminal from the same directory. It polls the same 
 uv run --locked python -m ticketing.worker
 ```
 
+### Load and read the sample tickets
+
+From a third terminal in the repository root, submit the ten appendix tickets through the API. The loader prints the ID, HTTP status, and ticket status for each submission.
+
+```sh
+uv run --locked python samples/load.py
+curl -s 'http://127.0.0.1:8000/tickets/t-1005'
+curl -s 'http://127.0.0.1:8000/tickets?category=billing&priority=low&limit=2'
+```
+
+New tickets return `202`. After the worker processes them, the combined query includes the invoice-download ticket (`t-1005`). Run the loader again to see ten `200` responses on a clean demo database. A `409` identifies an ID already used for different content. The loader stops and prints that ID.
+
+### Existing databases
+
 Compose applies the SQL files in `migrations/` in order on a fresh MySQL 8.4 volume. The API defaults to the local Compose credentials on `127.0.0.1:3307`. To use another MySQL instance, apply the migrations in order and configure `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD` for the API.
 
 For an existing PR 1 or PR 2 volume, start the database and apply migration 002 once after MySQL accepts connections. Existing tickets keep their IDs, content, and status.
@@ -26,16 +42,6 @@ For an existing PR 1 or PR 2 volume, start the database and apply migration 002 
 docker compose up -d db
 docker compose exec -T db sh -c 'MYSQL_PWD="$MYSQL_PASSWORD" mysql -u "$MYSQL_USER" "$MYSQL_DATABASE"' < migrations/002_ticket_work.sql
 ```
-
-Submit a ticket, then fetch it from another terminal. IDs are case-sensitive and accept up to 128 ASCII letters, digits, underscores, or hyphens.
-
-```sh
-curl -i http://127.0.0.1:8000/tickets -H 'Content-Type: application/json' \
-  -d '{"id":"t-1001","subject":"Charged twice","body":"I see two charges for one subscription."}'
-curl -i http://127.0.0.1:8000/tickets/t-1001
-```
-
-The first submission returns `202`. Poll `GET /tickets/t-1001` to see `classified` with top-level `category`, `priority`, and `summary`, or `failed` with a `failure_reason`. An identical submission returns the current ticket with `200`. Changing the subject or body while reusing the ID returns `409`.
 
 ### Run the tests
 
@@ -56,12 +62,16 @@ Inserting a pending ticket also schedules it for classification. This avoids a f
 
 ## HTTP contract
 
-| Request | Proposed behavior |
+| Request | Behavior |
 | --- | --- |
 | `POST /tickets` | Accept `id`, `subject`, and `body`. Commit a new ticket as `pending` and return `202` with its ID and status. Allow an empty subject, as in the sample data. |
 | Repeat `POST /tickets` | Enforce uniqueness on the ticket ID in MySQL. For identical content, return the existing ticket with `200` regardless of status. For different content under that ID, return `409`. Both paths leave the original work item intact. |
 | `GET /tickets/{id}` | Return the ticket and status, including classification fields on success or a short failure reason on terminal failure. Return `404` for an unknown ID. |
 | `GET /tickets` | Accept optional `category` and `priority` filters and apply both when supplied. Use a bounded `limit` and a cursor over `(created_at, id)`, newest first. Unfiltered results include every status. Label filters match classified tickets only. |
+
+A list response contains an `items` array and includes `next_cursor` only when another page is available. Pass it as `cursor` with the same filters. The default limit is 20 and the allowed range is 1–100. The cursor is the last returned ticket ID. The API looks up its immutable creation time and resumes strictly below that time and ID, including when several tickets share a timestamp.
+
+A missing cursor ticket, invalid filter, or out-of-range limit returns `422`. Error responses have a `detail` field containing a message or FastAPI's list of validation errors.
 
 ## Worker and recovery
 
@@ -97,9 +107,13 @@ Require all three fields, reject unexpected fields, and validate before writing.
 
 The sample ticket `t-1005` illustrates the limit of enums. Its request concerns invoice downloads, but the body asks for the valid labels `technical` and `high` and a summary claiming a refund was approved. Under the proposed rubric the expected labels are `billing` and `low`, and the summary should describe the invoice question.
 
-## Implementation PRs
+## Limitations and next steps
 
-Open one PR per slice, in order. Start each branch from updated `main` after the previous PR merges. Include the tests and local run commands for each slice in the same PR. All five should be testable without an API key.
+The fake uses English keywords and canned summaries. For example, it can identify the invoice topic in `t-1007` but miss the customer's correction deadline. Schema validation cannot establish whether a summary is accurate. With more time, I would compare a live classifier against a small labeled set, including clean and instruction-laden versions of the same request.
+
+List pages read current data. A pending ticket that becomes classified after a client has paged past its position can appear on a fresh filtered query. At higher volume, measure the list queries and add indexes for the most common filter and sort combinations.
+
+## Implementation PRs
 
 | PR | Scope | How to verify it |
 | --- | --- | --- |
@@ -108,5 +122,3 @@ Open one PR per slice, in order. Start each branch from updated `main` after the
 | 3. Claim work and recover interrupted attempts | Add the worker-state migration and MySQL operations for claiming, retrying, completing, and failing a ticket. | With two database connections, prove only one can claim the same pending ticket. Advance a controlled clock past lease expiry, reclaim it, then verify that the old token cannot commit. Expire the third attempt and verify the ticket becomes `failed`. |
 | 4. Run the asynchronous worker | Connect the worker to the fake classifier and validated storage path. Apply timeouts, backoff, and the three-attempt limit. Document how to start the worker. | Submit with the worker stopped and observe `pending`. Start it and read back a classification. Script a timeout followed by success, then three invalid responses. Verify the latter ends in `failed` with no classification fields. Resubmit a completed ticket and assert the classifier call count stays the same. |
 | 5. List tickets and demonstrate the take-home | Add category and priority filters, cursor pagination, and a loader for all ten appendix tickets. Finish the clean-clone instructions and document limitations observed during testing. | Test each filter and their intersection. Page across tied timestamps and verify each expected ID appears once. From a clean database, run the sample loader twice, let the worker finish, and verify there are exactly ten tickets. |
-
-If time remains after PR 5, pick one extension. A small live-classifier evaluation could compare the invoice question with and without the embedded instructions. Score the labels and inspect both summaries for an invented refund approval.
